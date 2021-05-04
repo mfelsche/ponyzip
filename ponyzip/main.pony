@@ -1,248 +1,212 @@
-use "lib:z"
+use "lib:zip"
 use "format"
 use "debug"
 use "files"
+use "collections"
 
-// impossible to get the sizeof of a pony struct as of now
-//use @inflateInit_[I32](stream: NullablePointer[ZStream], version: Pointer[U8] tag, zstream_size: USize)
-use @compress2[I32](dest: Pointer[U8] tag, dest_len: Pointer[ULong] tag, source: Pointer[U8] tag, source_len: ULong, level: I32)
-use @compressBound[ULong](input_bytes: ULong)
-use @uncompress[I32](dest: Pointer[U8] tag, dest_len: Pointer[ULong] tag, source: Pointer[U8] tag, source_len: ULong)
+use @zip_open[Pointer[_ZipArchive] tag](path: Pointer[U8] tag, flags: U32, errorp: Pointer[I32] tag)
+use @zip_close[I32](archive: Pointer[_ZipArchive] tag)
+use @zip_discard[None](archive: Pointer[_ZipArchive] tag)
+use @zip_get_error[Pointer[_ZipError] tag](archive: Pointer[_ZipArchive] tag)
+use @zip_error_code_zip[I32](err: Pointer[_ZipError] tag)
+use @zip_error_code_system[I32](err: Pointer[_ZipError] tag)
+use @zip_error_system_type[I32](err: Pointer[_ZipError] tag)
+use @zip_error_strerror[Pointer[U8] ref](err: Pointer[_ZipError] tag)
 
-/**
- *
-struct z_stream_s {
-    z_const Bytef *next_in;     /* next input byte */
-    uInt     avail_in;  /* number of bytes available at next_in */
-    uLong    total_in;  /* total number of input bytes read so far */
+primitive _ZipArchive
+class ref ZipArchive
+  """represents an opened zip archive"""
+  var _inner: Pointer[_ZipArchive] tag
+  let _path: FilePath
 
-    Bytef    *next_out; /* next output byte will go here */
-    uInt     avail_out; /* remaining free space at next_out */
-    uLong    total_out; /* total number of bytes output so far */
+  new ref _create(inner: Pointer[_ZipArchive] tag, path': FilePath) =>
+    _inner = inner
+    _path = path'
 
-    z_const char *msg;  /* last error message, NULL if no error */
-    struct internal_state FAR *state; /* not visible by applications */
+  fun path(): String val => _path.path
 
-    alloc_func zalloc;  /* used to allocate the internal state */
-    free_func  zfree;   /* used to free the internal state */
-    voidpf     opaque;  /* private data object passed to zalloc and zfree */
+  fun get_error(): ZipError =>
+    ZipError._create(@zip_get_error(_inner))
 
-    int     data_type;  /* best guess about the data type: binary or text
-                           for deflate, or the decoding state for inflate */
-    uLong   adler;      /* Adler-32 or CRC-32 value of the uncompressed data */
-    uLong   reserved;   /* reserved for future use */
-} z_stream;
-*/
+  fun is_closed(): Bool =>
+    _inner.is_null()
 
-struct ZStream
-  let next_in: Pointer[U8] tag // const unsigned char*
-  var avail_in: U32   // unsigned int
-  var total_in: ULong // unsigned long
+  fun ref close() ? =>
+    """
+    Write to disk and free and invalidate this instance.
 
-  var next_out: Pointer[U8] tag // unsigned char*
-  var avail_out: U32 // unsigned int
-  var total_out: ULong // unsigned long
+    If close succeeds, this instance is invalid, and should not be used anymore.
+    If it errors, call `get_error()` to get the cause and finally call `discard()`
+    in order to free this instance, otherwise it might leak memory.
+    """
+    match @zip_close(_inner)
+    | 0 =>
+      // set a NULL pointer - all operation on _inner are now exploding
+      _inner = Pointer[_ZipArchive].create()
+    | -1 => error
+    end
 
-  var msg: Pointer[U8] tag = Pointer[U8] // last error message
-  var internal_state: Pointer[None] tag = Pointer[None]
+  fun ref discard() =>
+    """Closes this archive and discards all changes, not writing them to disk."""
+    @zip_discard(_inner)
+    // set a NULL pointer
+    _inner = Pointer[_ZipArchive].create()
 
-  // NULL here will make it use the system allocator
-  var zalloc: Pointer[None] tag = Pointer[None] // function pointer to a custom allocation function
-  var zfree:  Pointer[None] tag = Pointer[None] // function pointer to a custom free function
+  fun _final() =>
+    """ensure we free all memory that has been allocated."""
+    if not _inner.is_null() then
+      @zip_discard(_inner)
+    end
 
-  var opaque: Pointer[None] tag = Pointer[None]
+primitive _ZipError
+class ZipError
+  let _inner: Pointer[_ZipError] tag
 
-  var data_type: I32 = 0 // int
-  var adler: ULong = 0 // unsigned long, adler-32 or crc-32 value of uncompressed data
-  var reserved: ULong = 0 // unsigned long, reserved for future use
+  new _create(inner: Pointer[_ZipError] tag) =>
+    _inner = inner
 
-  new create() =>
-  //new inflate(compressed: Array[U8] box, out: Array[U8] ref) =>
-    next_in = Pointer[U8]
-    avail_in = 0
-    total_in = 0
-    next_out = Pointer[U8]
-    avail_out = 0
-    total_out = 0
+  fun zip_errno(): I32 =>
+    @zip_error_code_zip(_inner)
+
+  fun system_errno(): I32 =>
+    @zip_error_code_system(_inner)
+
+  fun system_type(): I32 =>
+    @zip_error_system_type(_inner)
+
+  fun string(): String iso^ =>
+    recover
+      let raw = @zip_error_strerror(_inner)
+      String.copy_cstring(raw)
+    end
 
 
-primitive ZCompressionLevel
-  fun z_no_compression(): I32 => 0
-  fun z_best_speed(): I32 => 1
-  fun z_best_compression(): I32 => 9
-  fun z_default_compression(): I32 => -1
 
-primitive ZCheckReturn
-  fun apply(r: I32): ZReturn =>
-    match r
-    | ZOk() => ZOk
-    | ZStreamEnd() => ZStreamEnd
-    | ZNeedDict() => ZNeedDict
-    | ZErrno() => ZErrno
-    | ZStreamError() => ZStreamError
-    | ZDataError() => ZDataError
-    | ZMemError() => ZMemError
-    | ZBufError() => ZBufError
-    | ZVersionError() => ZVersionError
+primitive _ZipFile
+class ZipFile
+  let _inner: Pointer[_ZipFile] tag
+
+  new _create(inner: Pointer[_ZipFile] tag) =>
+    _inner = inner
+
+primitive ZipSource
+
+primitive CREATE
+  """Create the archive if it does not exist."""
+  fun value(): U32 => 1
+
+primitive EXCL
+  """Error is archive already exists"""
+  fun value(): U32 => 2
+
+primitive CHECKCONS
+  """Perform additional stricter consistency checks on the archive, and error if they fail"""
+  fun value(): U32 => 4
+
+primitive TRUNCATE
+  """If archive exists, ignore its current contents. In other words, handle it the same way as an empty archive."""
+  fun value(): U32 => 8
+
+primitive RDONLY
+  """Open archive in read-only mode."""
+  fun value(): U32 => 16
+
+type OpenFlags is Flags[(CREATE | EXCL | CHECKCONS | TRUNCATE | RDONLY), U32]
+
+primitive ArchiveExists
+  fun apply(): I32 => 10
+  fun string(): String =>
+    "File already exists"
+
+primitive ArchiveInconsistencies
+  fun apply(): I32 => 21
+  fun string(): String =>
+    "Zip archive inconsistent"
+
+primitive InvalidArgument
+  fun apply(): I32 => 18
+  fun string(): String =>
+    "Invalid Argument"
+
+primitive MallocFailure
+  fun apply(): I32 => 14
+  fun string(): String =>
+    "Malloc failure"
+
+primitive NoSuchFile
+  fun apply(): I32 => 9
+  fun string(): String =>
+    "No such file"
+
+primitive NoZipArchive
+  fun apply(): I32 => 19
+  fun string(): String =>
+    "Not a zip archive"
+
+primitive OpenFailed
+  fun apply(): I32 => 11
+  fun string(): String =>
+    "Can't open file"
+
+primitive ReadError
+  fun apply(): I32 => 5
+  fun string(): String =>
+    "Read Error"
+
+primitive SeekError
+  fun apply(): I32 => 4
+  fun string(): String =>
+    "Seek Error"
+
+class UnknownError
+  let _err: I32
+
+  new create(err: I32) =>
+    _err = err
+
+  fun apply(): I32 => _err
+
+  fun string(): String =>
+    "Unknown Error " + _err.string()
+
+type ZipOpenError is (
+  ArchiveExists
+  | ArchiveInconsistencies
+  | InvalidArgument
+  | MallocFailure
+  | NoSuchFile
+  | NoZipArchive
+  | OpenFailed
+  | ReadError
+  | SeekError
+  | UnknownError)
+
+primitive ZipCheckReturn
+  fun apply(err: I32): (ZipOpenError | None) =>
+    match err
+    | 0 => None // all is good
+    | ArchiveExists() => ArchiveExists
+    | ArchiveInconsistencies() => ArchiveInconsistencies
+    | InvalidArgument() => InvalidArgument
+    | MallocFailure() => MallocFailure
+    | NoSuchFile() => NoSuchFile
+    | NoZipArchive() => NoZipArchive
+    | OpenFailed() => OpenFailed
+    | ReadError() => ReadError
+    | SeekError() => SeekError
     else
-      ZUnknownError
+      UnknownError(err)
     end
 
-primitive ZOk is (Stringable & Equatable[ZReturn])
-  fun apply(): I32 => 0
-  fun string(): String iso^ =>
-    "ZOk".string()
-primitive ZStreamEnd is (Stringable & Equatable[ZReturn])
-  fun apply(): I32 => 1
-  fun string(): String iso^ =>
-    "ZStreamEnd".string()
-primitive ZNeedDict is (Stringable & Equatable[ZReturn])
-  fun apply(): I32 => 2
-  fun string(): String iso^ =>
-    "ZNeedDict".string()
-primitive ZErrno is (Stringable & Equatable[ZReturn])
-  fun apply(): I32 => -1
-  fun string(): String iso^ =>
-    "ZErrno".string()
-primitive ZStreamError is (Stringable & Equatable[ZReturn])
-  fun apply(): I32 => -2
-  fun string(): String iso^ =>
-    "ZStreamError".string()
-primitive ZDataError is (Stringable & Equatable[ZReturn])
-  fun apply(): I32 => -3
-  fun string(): String iso^ =>
-    "ZDataError".string()
-primitive ZMemError is (Stringable & Equatable[ZReturn])
-  fun apply(): I32 => -4
-  fun string(): String iso^ =>
-    "ZMemError".string()
-primitive ZBufError is (Stringable & Equatable[ZReturn])
-  fun apply(): I32 => -5
-  fun string(): String iso^ =>
-    "ZBufError".string()
-primitive ZVersionError is (Stringable & Equatable[ZReturn])
-  fun apply(): I32 => -6
-  fun string(): String iso^ =>
-    "ZVersionError".string()
-primitive ZUnknownError is (Stringable & Equatable[ZReturn])
-  fun apply(): I32 => 42 // chose some unused error number
-  fun string(): String iso^ =>
-    "ZUnknown".string()
 
-
-type ZReturn is (ZOk | ZError)
-type ZError is (ZStreamEnd | ZNeedDict | ZErrno | ZStreamError | ZDataError | ZMemError | ZStreamError | ZDataError | ZMemError | ZBufError | ZVersionError | ZUnknownError)
-
-
-
-primitive ZLib
-
-  fun z_binary(): I32 => 0
-  fun z_text(): I32 => 1
-  fun z_unknown(): I32 => 2
-
-  fun z_default_compression(): I32 => -1
-
-  fun compress_bound(input_len: USize): USize =>
-    """
-    returns the maximum number of bytes needed when compressing `input_len` bytes.
-    """
-    @compressBound(input_len.ulong()).usize()
-
-  fun compress(data: Array[U8] box, level: I32 = ZCompressionLevel.z_default_compression()): (Array[U8] iso^ | ZError) =>
-    """
-    Will allocate a new Array to write compressed data to and return that.
-    """
-    let output: Array[U8] iso = recover Array[U8].create(0) end
-    output.undefined[U8](compress_bound(data.size()))
-    match compress_raw(data, consume output, level)
-    | (ZOk, let out: Array[U8] iso) => consume out
-    | (let e: ZError, _) => e
-    else
-      ZUnknownError
+primitive Zip
+  fun open(path: FilePath, flags: OpenFlags): (ZipArchive | ZipOpenError) =>
+    var err: I32 = 0
+    let rawzip = @zip_open(path.path.cstring(), flags.value(), addressof err)
+    match ZipCheckReturn(err)
+    | None => ZipArchive._create(rawzip, path)
+    | let zoe: ZipOpenError => zoe
     end
 
-  fun compress_raw(data: Array[U8] box, output: Array[U8] iso, level: I32 = ZCompressionLevel.z_default_compression()): (ZReturn, Array[U8] iso^) =>
-    """
-    This will actually write the compressed data into the contents of the given output array.
-    returns number of bytes actually written.
-    """
-    var size: ULong = output.size().ulong()
-    let retval = @compress2(output.cpointer(), addressof size, data.cpointer(), data.size().ulong(), level)
-    let zreturn = ZCheckReturn(retval)
-    match zreturn
-    | ZOk =>
-      output.trim_in_place(0, size.usize())
-    end
-    (zreturn, consume output)
 
-  fun uncompress(data: Array[U8] box, output_len: USize = 4096): (Array[U8] iso^ | ZError) =>
-    let output = recover Array[U8].create(0) end
-    var dest_len = output_len.ulong()
-    output.undefined[U8](dest_len.usize())
-
-    var zreturn: ZReturn = ZBufError
-
-    while zreturn == ZBufError do
-
-      zreturn = ZCheckReturn(@uncompress(output.cpointer(), addressof dest_len, data.cpointer(), data.size().ulong()))
-      match zreturn
-      | ZBufError =>
-        // not enough room in output buffer
-        // grow output buffer and retry
-        dest_len = dest_len * 2
-        output.undefined[U8](dest_len.usize())
-      end
-
-    end
-    match zreturn
-    | ZOk =>
-      output.trim_in_place(0, dest_len.usize())
-      return output
-    | let e: ZError =>
-      return e
-    else
-      ZUnknownError
-    end
-
-actor Main
-  new create(env: Env) =>
-    let raw_version = @zlibVersion[Pointer[U8] ref]()
-    let version = String.from_cstring(raw_version)
-    env.out.print("zlib: " + version)
-    try
-      let p = env.args(1)?
-      let fp = FilePath(env.root as AmbientAuth, p)?
-      match OpenFile(fp)
-      | let f: File =>
-        let content = f.read(f.size())
-        if Path.ext(fp.path) == "zip" then
-          match ZLib.uncompress(consume content)
-          | let uc: Array[U8] iso =>
-            let y: Array[U8] val = consume uc
-            env.out.print(String.from_array(y))
-          | let uze: ZError =>
-            env.err.print("Error uncompress: " + uze.string())
-          end
-        else
-          let size = content.size()
-          match ZLib.compress(consume content)
-          | let uc: Array[U8] iso =>
-            env.out.write(consume uc)
-            //env.out.print("compressed from " + size.string() + " to " + uc.size().string() + " bytes.")
-          | let uze: ZError =>
-            env.err.print("Error compress: " + uze.string())
-          end
-        end
-      end
-    end
-    let res = @"llvm.x86.aesni.aesenc"(I128(1), I128(1))
-    env.out.print(res.string())
-
-  fun print_hex(d: Array[U8] box, out: OutStream) =>
-    out.write("0x")
-    for x in d.values() do
-      out.write(Format.int[U8](x where fmt = FormatHexBare))
-    end
-    out.write("\n")
 

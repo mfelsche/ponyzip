@@ -1,0 +1,12 @@
+{
+  "packages": [],
+  "deps": [],
+  "info": {
+    "description": "Library for handling zip files",
+    "homepage": "https://github.com/mfelsche/ponyzip",
+    "license": "MIT",
+    "documentation_url": "",
+    "version": "0.1",
+    "name": "ponyzip"
+  }
+}

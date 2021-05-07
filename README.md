@@ -9,7 +9,7 @@ Wrapper around [`libzip`](https://libzip.org).
 - Add `ponyzip` to your dependencies
 
 ```sh
-corral add mfelsche/ponyzip --revision=0.1
+corral add mfelsche/ponyzip --revision=v0.1.0
 ```
 
 - Install [`libzip`](https://libzip.org).

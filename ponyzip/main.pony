@@ -9,7 +9,7 @@ use @zip_libzip_version[Pointer[U8] ref]()
 
 
 primitive Zip
-  fun open(path: FilePath, flags: OpenFlags): (ZipArchive | ZipError) =>
+  fun open(path: FilePath, flags: OpenFlags = OpenFlags.create()): (ZipArchive | ZipError) =>
     var err: I32 = 0
     // TODO: check path caps in correspondance with OpenFlags
     let rawzip = @zip_open(path.path.cstring(), flags.value(), addressof err)
